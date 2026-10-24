@@ -697,6 +697,24 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     update(direct, 2);
     recorder.Sync();
     Require(*block == 45, "direct consumers lost GPU-ordered updates");
+    for (const bool reuse : {false, true}) {
+        const auto* imported = HostImportFor(context, address, bytes);
+        Require(imported != nullptr, "the label-ordering input lost its import");
+        const auto commands = recorder.Commands();
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, imported->buffer, HostImportOffset(*imported, address), 4, 43);
+        const std::uint32_t value = 43;
+        recorder.NoteLabel(address, std::as_bytes(std::span(&value, 1)), 1001, 0);
+        auto completed = std::make_shared<bool>(false);
+        Require(recorder.AfterRecordedWork([completed] { *completed = true; }), "the unrelated completion was not queued");
+        Require(recorder.PendingLabelIn(address, 4) && !recorder.CompletionLabelIn(address, 4), "the GPU label was classified as a CPU completion store");
+        Require(!CompletePendingCpuWrites(context, address, 4), "an unrelated completion forced a CPU wait for a GPU-ordered label");
+        if (reuse) Require(direct->Revalidate(std::span(&compute, 1)), "a GPU-only label prevented direct consumer reuse");
+        else direct = std::make_shared<ShaderResources>(context, compute);
+        Require(!*completed, "the GPU-only label consumer completed unrelated host work");
+        update(direct, 2);
+        recorder.Sync();
+        Require(*completed && *block == 45, "the GPU label consumer lost its value or completion");
+    }
     {
         std::array<std::uint32_t, 1024> unregistered{};
         struct Finish {
@@ -1385,6 +1403,26 @@ void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     Require(ran == std::vector<int>{1, 2, 3} && Recorder::PendingCompletionLabels() == 0 && recorder.Idle(), "actions behind recorded work did not run once each, in order");
     Require(seen == 1, "an action ran before the completion label recorded ahead of it");
+}
+
+void completionWaitTests(const Device& device, Recorder& recorder) {
+    alignas(64) static std::uint32_t memory[16];
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    recorder.Sync();
+    const std::array<std::byte, 4> gpuValue{std::byte{5}, std::byte{0}, std::byte{0}, std::byte{0}};
+    auto ran = std::make_shared<bool>(false);
+    recorder.NotePendingWrite(base, sizeof(memory));
+    recorder.AfterCompletions(base, gpuValue, 7, 0, true);
+    Require(recorder.AfterRecordedWork([ran] { *ran = true; }) && Recorder::PendingCompletionLabels() != 0, "completion wait: the action behind the open batch is not pending");
+    CompletePendingCpuWrites(device.GetContext(), base, sizeof(memory));
+    Require(!*ran && !recorder.Idle(), "completion wait: a reader of a GPU-stored label waited for a batch whose only completion action writes no memory");
+    recorder.Sync();
+    Require(*ran && recorder.Idle(), "completion wait: the action did not run at the sync");
+    const std::array<std::byte, 4> cpuValue{std::byte{9}, std::byte{0}, std::byte{0}, std::byte{0}};
+    recorder.NotePendingWrite(base, sizeof(memory));
+    recorder.AfterCompletions(base + 4u, cpuValue, 8, 0, false);
+    CompletePendingCpuWrites(device.GetContext(), base, sizeof(memory));
+    Require(memory[1] == 9u && Recorder::PendingCompletionLabels() == 0, "completion wait: a reader of a label stored behind a completion did not wait for that store");
 }
 
 int gpuTimingCompletionTests(const Device& device, bool incomplete) {
@@ -10488,7 +10526,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     constexpr std::array<std::uint8_t, 4> blue{0, 0, 255, 255};
     constexpr std::array<std::uint8_t, 8> green{0, 0, 0x00, 0x3c, 0, 0, 0x00, 0x3c};
     constexpr std::array<std::uint8_t, 8> cleared{};
-    enum class Order { Superseded, ReadFirst, Rewritten, CpuStore };
+    enum class Order { Superseded, ReadFirst, Rewritten, CpuStore, SampledClear };
     struct Outcome {
         std::vector<std::byte> bytes;
         std::vector<std::byte> imageB;
@@ -10496,9 +10534,10 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         std::uint64_t superseded = 0;
     };
     const auto run = [&](bool on, Order order) {
-        const std::string where = what + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : order == Order::Rewritten ? ", A written again after the hand-over" : ", a CPU store before B wrote") + (on ? ", on" : ", off");
+        const std::string where = what + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : order == Order::Rewritten ? ", A written again after the hand-over" : order == Order::CpuStore ? ", a CPU store before B wrote" : ", B sampled under clear keys") + (on ? ", on" : ", off");
         StorageTexture::SetClearHandOver(on);
         recorder.Sync();
+        ClearCachedTextures(context.device);
         std::memset(memory, 0x55, surfaceA);
         std::memset(memory + surfaceA, 0x00, keyCount);
         Outcome outcome{};
@@ -10506,7 +10545,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         const auto superseded = StorageTexture::HandedOverSuperseded();
         {
             auto imageA = StorageTexture::Create(context, detiler, resourceA, 0);
-            auto imageB = StorageTexture::Create(context, detiler, resourceB, 0);
+            auto imageB = CachedStorageSurface(context, resourceB);
             draw(imageA, {{1.0f, 0.0f, 0.0f, 1.0f}});
             imageB->Refresh();
             if (on && watched) {
@@ -10532,6 +10571,19 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
             if (order == Order::CpuStore) {
                 std::memset(memory + 65536, 0x77, 65536);
             }
+            if (order == Order::SampledClear) {
+                const auto meta = resourceB.dccAddress >> 8u;
+                std::array<std::uint32_t, 8> words{};
+                words[0] = static_cast<std::uint32_t>(resourceB.baseAddress >> 8u);
+                words[1] = static_cast<std::uint32_t>((resourceB.baseAddress >> 40u) & 0xffu) | (resourceB.format << 20u) | (((resourceB.width - 1u) & 3u) << 30u);
+                words[2] = ((resourceB.width - 1u) >> 2u) | ((resourceB.height - 1u) << 14u);
+                words[3] = 0xfa4u | (27u << 20u) | (9u << 28u);
+                words[6] = (1u << 21u) | static_cast<std::uint32_t>((meta & 0xffu) << 24u);
+                words[7] = static_cast<std::uint32_t>(meta >> 8u);
+                const auto sampled = CachedSampledTexture(context, words);
+                Require(sampled != nullptr && sampled->ViewsStorageImage() && sampled->SharedStorageSource() == imageB, where + ": B sampled under clear keys did not view B's cleared storage image");
+                if (on && watched) Require(std::all_of(memory, memory + 2 * 65536, [](std::uint8_t value) { return value == 0x55; }), where + ": sampling B stored A's results over B");
+            }
             draw(imageB, {{0.0f, 1.0f, 0.0f, 1.0f}});
             Require(StorageTexture::FlushPending(address, bytes, nullptr, "clear-key hand-over test", PublishScope::Whole), where + ": nothing was pending at the end");
             recorder.Submit();
@@ -10540,13 +10592,14 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
             outcome.bytes = readMemory(address, surfaceA);
             Require(filled(readImage(imageB, 128, 128, 8), green), where + ": B lost its results");
         }
+        ClearCachedTextures(context.device);
         outcome.handOvers = StorageTexture::ClearHandOvers() - handOvers;
         outcome.superseded = StorageTexture::HandedOverSuperseded() - superseded;
         recorder.Sync();
         return outcome;
     };
-    for (const auto order : {Order::Superseded, Order::ReadFirst, Order::Rewritten, Order::CpuStore}) {
-        const std::string name = what + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : order == Order::Rewritten ? ", A written again after the hand-over" : ", a CPU store before B wrote");
+    for (const auto order : {Order::Superseded, Order::ReadFirst, Order::Rewritten, Order::CpuStore, Order::SampledClear}) {
+        const std::string name = what + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : order == Order::Rewritten ? ", A written again after the hand-over" : order == Order::CpuStore ? ", a CPU store before B wrote" : ", B sampled under clear keys");
         const auto off = run(false, order);
         const auto on = run(true, order);
         const auto& lastA = order == Order::Rewritten ? blue : red;
@@ -10559,7 +10612,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
             Require(on.handOvers == 0, name + ": results were handed over in memory the write tracker does not watch");
             continue;
         }
-        if (order == Order::Superseded) Require(on.superseded == 2, name + ": B's results did not drop A's two units under B (dropped " + std::to_string(on.superseded) + ")");
+        if (order == Order::Superseded || order == Order::SampledClear) Require(on.superseded == 2, name + ": B's results did not drop A's two units under B (dropped " + std::to_string(on.superseded) + ")");
         if (order == Order::ReadFirst) Require(on.superseded <= 1, name + ": a unit stored by the read was dropped again");
     }
     std::cout << what << ": ok\n";
@@ -11078,6 +11131,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--completion-wait-only") {
+            completionWaitTests(device, recorder);
+            std::cout << "Completion wait tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {

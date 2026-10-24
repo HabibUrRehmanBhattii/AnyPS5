@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FragmentBarycentric.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Float32FlushControl.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
@@ -122,8 +123,17 @@ DeviceQueuePlan PlanDeviceQueues(std::span<const VkQueueFamilyProperties> famili
 
 namespace {
 
+void DumpRingsOnDeviceLoss() noexcept {
+    static std::atomic<bool> dumped{false};
+    if (dumped.exchange(true)) return;
+    DriverDetail::DumpSubmissionRingsAfterFailure();
+}
+
 void check(VkResult result, const char* operation) {
-    if (result == VK_ERROR_DEVICE_LOST) Graphics::ReportDeviceLost();
+    if (result == VK_ERROR_DEVICE_LOST) {
+        Graphics::ReportDeviceLost();
+        DumpRingsOnDeviceLoss();
+    }
     if (result != VK_SUCCESS) {
         throw std::runtime_error(std::string(operation) + ": Vulkan result " + std::to_string(result));
     }
@@ -2120,6 +2130,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
                 for (const auto& line : owner->markerLog.Report(words[0], words[1])) std::fprintf(stderr, "%s\n", line.c_str());
             }
             for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData)) std::fprintf(stderr, "%s\n", line.c_str());
+            DumpRingsOnDeviceLoss();
         };
         Graphics::DeviceLostOwner() = state.get();
         state->deviceLostHook = true;
@@ -2325,6 +2336,7 @@ void VulkanDevice::PrepareForReplacement() {
 
 void VulkanDevice::WaitIdle() {
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle begin");
+    static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("wait idle"));
     RetirePresents(0);
     if (state->recorder) {
         // Announced with this call's return address: the [recorder] site table then names the
@@ -2429,6 +2441,7 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
     if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
+    if (queue == 0) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("label"));
     Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label");
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     auto& recorder = *state->recorder;
@@ -2597,7 +2610,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         if (!sync && Graphics::Recorder::PendingCompletionLabels() != 0) {
             // A label the CPU will store after a completion must not be overwritten by the fill:
             // only a label inside the filled range matters, whatever the range's size.
-            sync = recorder.PendingLabelIn(address, bytes);
+            sync = recorder.CompletionLabelIn(address, bytes);
             if (sync) ++labelSynced;
         }
         if (sync) {
@@ -3316,6 +3329,13 @@ FrameDumps& Dumps() {
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
+    static const bool traceQueue = std::getenv("APS5_TRACE_QUEUE") != nullptr;
+    if (traceQueue) {
+        const auto resident = Graphics::StorageTexture::FindPendingSlice(buffer.address, DisplayBufferSize(buffer));
+        static int described = 0;
+        if (described++ < 4) std::fprintf(stderr, "[present] buffer 0x%llx %ux%u format 0x%llx tiling %u pitch %u dcc 0x%llx resident %d\n", static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height,
+                     static_cast<unsigned long long>(buffer.pixelFormat), buffer.tilingMode, buffer.pitchInPixel, static_cast<unsigned long long>(buffer.dccAddress), resident != nullptr ? 1 : 0);
+    }
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
@@ -3650,12 +3670,14 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &commands;
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = &rendered;
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    const auto queueResult = state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence);
+    if (std::getenv("APS5_TRACE_QUEUE") != nullptr) {
+        std::fprintf(stderr, "[queue] present slot %zu image %u fence 0x%llx semaphore 0x%llx result %d\n", static_cast<std::size_t>(&slot - state->presentSlots.data()), index, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(slot.fence)), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(rendered)), static_cast<int>(queueResult));
+    }
+    check(queueResult, "vkQueueSubmit clear");
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -3723,6 +3745,19 @@ bool VulkanDevice::PresentWaitsForSlots(const DisplayBuffer* buffer) const {
     return PresentableResident(graphicsContext(), *buffer, filter, pending, convert, layer) == nullptr;
 }
 
+void VulkanDevice::PrepareDisplayRead(const DisplayBuffer& buffer) const {
+    static const bool locked = std::getenv("APS5_NO_EARLY_DISPLAY_FLUSH") != nullptr;
+    if (locked) return;
+    if (buffer.tilingMode != 1 && !NoResidentPresent()) {
+        VkFilter filter = VK_FILTER_LINEAR;
+        bool pending = false;
+        bool convert = false;
+        std::uint32_t layer = 0;
+        if (PresentableResident(graphicsContext(), buffer, filter, pending, convert, layer) != nullptr) return;
+    }
+    GuestMemory::FlushGpuWrites(buffer.address, DisplayBufferSize(buffer));
+}
+
 void VulkanDevice::FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     submissions = state->recorder ? state->recorder->Submissions() : 0;
@@ -3775,12 +3810,13 @@ void VulkanDevice::QueuePresent() {
     const auto index = state->queueIndex;
     require(index < state->rendered.size(), "presented image index is out of range");
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &state->rendered[index];
     present.swapchainCount = 1;
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
+    if (std::getenv("APS5_TRACE_QUEUE") != nullptr) {
+        std::fprintf(stderr, "[queue] present-queue image %u result %d\n", index, static_cast<int>(presented));
+    }
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");
@@ -4975,6 +5011,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    static_cast<void>(Graphics::StorageTexture::StoreDrawnLinearTouching("dispatch access", touches, resources.HoldsLease()));
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);
@@ -5204,7 +5241,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
         capture.apiVersion = state->properties.apiVersion;
         std::copy_n(state->properties.pipelineCacheUUID, VK_UUID_SIZE, capture.pipelineCacheUuid.begin());
         const auto path = capture.WriteOptional(directory);
-        if (!path.empty()) std::fprintf(stderr, "[compute-capture] %s\n", path.string().c_str());
+        if (!path.empty()) std::fprintf(stderr, "[compute-capture] program=0x%llx %s\n", static_cast<unsigned long long>(programAddress), path.string().c_str());
     }
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
     CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
